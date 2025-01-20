@@ -1,19 +1,16 @@
-import tempfile  # Add this import at the top of the script
-
-# Other imports...
+import tempfile
+import time
+import yt_dlp as ytdl
+import os
+from pathlib import Path
 import streamlit as st
 from phi.agent import Agent
 from phi.model.google import Gemini
 from phi.tools.duckduckgo import DuckDuckGo
 from google.generativeai import upload_file, get_file
 import google.generativeai as genai
-
-import time
-from pathlib import Path
-import yt_dlp as ytdl
-import os
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -39,13 +36,13 @@ def initialize_agent():
         markdown=True,
     )
 
-## Initialize the agent
+# Initialize the agent
 multimodal_Agent = initialize_agent()
 
-# Option to either upload a video or provide a YouTube URL
+# Option to either upload a video, provide a YouTube URL, or provide a YouTube Playlist URL
 video_option = st.selectbox(
-    "Choose how to provide the video for analysis:",
-    options=["Upload Video", "Provide YouTube Link"]
+    "Choose how to provide the video(s) for analysis:",
+    options=["Upload Video", "Provide YouTube Link", "Provide YouTube Playlist Link"]
 )
 
 if video_option == "Upload Video":
@@ -100,38 +97,90 @@ elif video_option == "Provide YouTube Link":
             except Exception as e:
                 st.error(f"An error occurred while downloading the video: {e}")
 
-# Text input for user to ask questions about the video
+elif video_option == "Provide YouTube Playlist Link":
+    # Field to input YouTube playlist link
+    playlist_url = st.text_input(
+        "Enter YouTube Playlist URL",
+        placeholder="Paste the YouTube playlist link here.",
+        help="Provide the link to a YouTube playlist for AI analysis."
+    )
+
+    if playlist_url:
+        with st.spinner("Downloading videos from the playlist..."):
+            download_dir = Path(__file__).parent  # Save in the current working directory
+
+            # Use yt-dlp to download all videos from the playlist
+            try:
+                ydl_opts = {
+                    'format': 'mp4',  # Specify MP4 format for download
+                    'outtmpl': str(download_dir / '%(title)s.%(ext)s'),  # Save with the video title
+                    'postprocessors': [{
+                        'key': 'FFmpegVideoConvertor',
+                        'preferedformat': 'mp4',  # Convert to MP4 format
+                    }],
+                }
+
+                with ytdl.YoutubeDL(ydl_opts) as ydl:
+                    info_dict = ydl.extract_info(playlist_url, download=True)
+                
+                # Get the list of downloaded video files
+                video_files = list(download_dir.glob('*.mp4'))
+                
+                if not video_files:
+                    st.error("No videos were downloaded from the playlist.")
+                else:
+                    # Display videos
+                    for video_file in video_files:
+                        st.video(str(video_file), format="video/mp4", start_time=0)
+
+            except Exception as e:
+                st.error(f"An error occurred while downloading the playlist: {e}")
+
+# Text input for user to ask questions about the video(s)
 user_query = st.text_area(
     "What insights are you seeking from the video?",
     placeholder="Ask anything about the video content. The AI agent will analyze and gather additional context if needed.",
     help="Provide specific questions or insights you want from the video."
 )
 
-if st.button("🔍 Analyze Video", key="analyze_video_button"):
+if st.button("🔍 Analyze Video(s)", key="analyze_video_button"):
     if not user_query:
         st.warning("Please enter a question or insight to analyze the video.")
     else:
         try:
-            with st.spinner("Processing video and gathering insights..."):
-                # Upload and process video file
-                processed_video = upload_file(video_path)
-                while processed_video.state.name == "PROCESSING":
-                    time.sleep(1)
-                    processed_video = get_file(processed_video.name)
+            with st.spinner("Processing video(s) and gathering insights..."):
+                video_paths = []
 
-                # Prompt generation for analysis
+                # Process single video or playlist
+                if video_option == "Upload Video" and video_file:
+                    video_paths.append(video_path)
+                elif video_option == "Provide YouTube Link" and youtube_url:
+                    video_paths.append(video_filename)
+                elif video_option == "Provide YouTube Playlist Link" and playlist_url:
+                    # Add all playlist videos to the video_paths list
+                    video_paths.extend([str(video_file) for video_file in download_dir.glob('*.mp4')])
+
+                # Analyze each video in the playlist
+                processed_videos = []
+                for video_path in video_paths:
+                    processed_video = upload_file(video_path)
+                    while processed_video.state.name == "PROCESSING":
+                        time.sleep(1)
+                        processed_video = get_file(processed_video.name)
+                    processed_videos.append(processed_video)
+
+                # Aggregate insights from all videos
                 analysis_prompt = (
                     f"""
-                    Analyze the uploaded video for content and context.
-                    Respond to the following query using video insights and supplementary web research:
+                    Analyze the uploaded videos and respond to the following query using video insights from all videos:
                     {user_query}
 
-                    Provide a detailed, user-friendly, and actionable response.
+                    Provide a detailed, user-friendly, and actionable response based on the content of the videos.
                     """
                 )
 
                 # AI agent processing
-                response = multimodal_Agent.run(analysis_prompt, videos=[processed_video])
+                response = multimodal_Agent.run(analysis_prompt, videos=processed_videos)
 
             # Display the result
             st.subheader("Analysis Result")
@@ -139,9 +188,6 @@ if st.button("🔍 Analyze Video", key="analyze_video_button"):
 
         except Exception as error:
             st.error(f"An error occurred during analysis: {error}")
-        finally:
-            # Clean up temporary video file
-            Path(video_path).unlink(missing_ok=True)
 
 # Customize text area height
 st.markdown(
