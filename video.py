@@ -10,10 +10,17 @@ from phi.tools.duckduckgo import DuckDuckGo
 from google.generativeai import upload_file, get_file
 import google.generativeai as genai
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
 API_KEY = st.secrets["GOOGLE_API_KEY"]
+
+# API_KEY = os.getenv("GOOGLE_API_KEY")
+
+if not API_KEY:
+    st.error("GOOGLE_API_KEY not found in environment variables. Please set it in your .env file.")
+    st.stop()
 
 if API_KEY:
     genai.configure(api_key=API_KEY)
@@ -28,174 +35,240 @@ st.set_page_config(
 st.title("Phidata Video AI Summarizer Agent 🎥🎤🖬")
 st.header("Powered by Gemini 2.0 Flash Exp")
 
+# Initialize session state
+if "video_paths" not in st.session_state:
+    st.session_state.video_paths = []
+if "current_input" not in st.session_state:
+    st.session_state.current_input = None
+if "last_uploaded_name" not in st.session_state:
+    st.session_state.last_uploaded_name = None
+
 @st.cache_resource
 def initialize_agent():
     return Agent(
         name="Video AI Summarizer",
-        model=Gemini(id="gemini-2.0-flash-exp"),
+        model=Gemini(id="gemini-2.5-flash"),
         tools=[DuckDuckGo()],
         markdown=True,
     )
 
-# Initialize the agent
 multimodal_Agent = initialize_agent()
 
-# Option to either upload a video, provide a YouTube URL, or provide a YouTube Playlist URL
+# Choose input method
 video_option = st.selectbox(
     "Choose how to provide the video(s) for analysis:",
-    options=["Upload Video", "Provide YouTube Link", "Provide YouTube Playlist Link"]
+    options=[
+        "Upload Video",
+        "Provide YouTube Link",
+        "Provide YouTube Playlist Link",
+        "Provide direct video URL (.mp4)"
+    ]
 )
+
+# ────────────────────────────────────────────────
+# INPUT HANDLING (only download/process when needed)
+# ────────────────────────────────────────────────
 
 if video_option == "Upload Video":
-    # File uploader for direct video upload
     video_file = st.file_uploader(
-        "Upload a video file", type=['mp4', 'mov', 'avi'], help="Upload a video for AI analysis"
+        "Upload a video file",
+        type=['mp4', 'mov', 'avi', 'mkv'],
+        key="video_uploader"
     )
-
     if video_file:
-        # Create a temporary file for the uploaded video
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_video:
-            temp_video.write(video_file.read())
-            video_path = temp_video.name
-
-        st.video(video_path, format="video/mp4", start_time=0)
+        # Only re-process if it's a new file
+        if (st.session_state.last_uploaded_name != video_file.name or
+                not st.session_state.video_paths):
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_video:
+                temp_video.write(video_file.read())
+                st.session_state.video_paths = [temp_video.name]
+                st.session_state.last_uploaded_name = video_file.name
+            st.success("Video uploaded successfully!")
+        if st.session_state.video_paths:
+            st.video(st.session_state.video_paths[0], format="video/mp4")
 
 elif video_option == "Provide YouTube Link":
-    # Field to input YouTube link
     youtube_url = st.text_input(
         "Enter YouTube Video URL",
-        placeholder="Paste the YouTube video link here.",
-        help="Provide the link to a YouTube video for AI analysis."
+        placeholder="https://youtu.be/...",
+        key="youtube_single"
     )
-
     if youtube_url:
-        with st.spinner("Downloading video from YouTube..."):
-            # Specify the project directory to save the video
-            download_dir = Path(__file__).parent  # This will set the directory to your current project folder
-            video_filename = download_dir / "downloaded_video.mp4"  # Save as 'downloaded_video.mp4'
+        # Download only if URL changed or no valid file exists
+        if (st.session_state.current_input != youtube_url or
+                not st.session_state.video_paths or
+                not Path(st.session_state.video_paths[0]).exists()):
 
-            # Use yt-dlp to download the video in MP4 format directly to the project directory
-            try:
-                ydl_opts = {
-                    'format': 'mp4',  # Specify MP4 format for download
-                    'outtmpl': str(video_filename),  # Save directly to the project directory
-                    'postprocessors': [{
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',  # Convert video to MP4 if it's in another format (like .webm)
-                    }],
-                }
+            with st.spinner("Downloading YouTube video..."):
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    video_filename = Path(temp_dir) / "youtube_video.mp4"
 
-                with ytdl.YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(youtube_url, download=True)
+                    ydl_opts = {
+                        'format': 'mp4',
+                        'outtmpl': str(video_filename),
+                        'postprocessors': [{
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        }],
+                    }
+                    with ytdl.YoutubeDL(ydl_opts) as ydl:
+                        ydl.extract_info(youtube_url, download=True)
 
-                # Check if the file was downloaded with the correct extension
-                if not video_filename.exists():
-                    st.error("The video was not downloaded in the expected format.")
-                else:
-                    st.video(str(video_filename), format="video/mp4", start_time=0)
-                    video_path = str(video_filename)  # Set the video path for processing
+                    if video_filename.exists() and video_filename.stat().st_size > 10000:
+                        st.session_state.video_paths = [str(video_filename)]
+                        st.session_state.current_input = youtube_url
+                        st.success("Video downloaded!")
+                    else:
+                        st.error("Downloaded file is invalid or empty.")
+                        st.session_state.video_paths = []
+                except Exception as e:
+                    st.error(f"Download failed: {e}")
+                    st.session_state.video_paths = []
 
-            except Exception as e:
-                st.error(f"An error occurred while downloading the video: {e}")
+        # Show video
+        if st.session_state.video_paths and Path(st.session_state.video_paths[0]).exists():
+            st.video(st.session_state.video_paths[0], format="video/mp4")
 
 elif video_option == "Provide YouTube Playlist Link":
-    # Field to input YouTube playlist link
     playlist_url = st.text_input(
         "Enter YouTube Playlist URL",
-        placeholder="Paste the YouTube playlist link here.",
-        help="Provide the link to a YouTube playlist for AI analysis."
+        placeholder="https://www.youtube.com/playlist?list=...",
+        key="youtube_playlist"
     )
-
     if playlist_url:
-        with st.spinner("Downloading videos from the playlist..."):
-            download_dir = Path(__file__).parent  # Save in the current working directory
+        if (st.session_state.current_input != playlist_url or
+                not st.session_state.video_paths):
 
-            # Use yt-dlp to download all videos from the playlist
-            try:
-                ydl_opts = {
-                    'format': 'mp4',  # Specify MP4 format for download
-                    'outtmpl': str(download_dir / '%(title)s.%(ext)s'),  # Save with the video title
-                    'postprocessors': [{
-                        'key': 'FFmpegVideoConvertor',
-                        'preferedformat': 'mp4',  # Convert to MP4 format
-                    }],
-                }
+            with st.spinner("Downloading playlist videos..."):
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    ydl_opts = {
+                        'format': 'mp4',
+                        'outtmpl': str(Path(temp_dir) / '%(title)s.%(ext)s'),
+                        'postprocessors': [{
+                            'key': 'FFmpegVideoConvertor',
+                            'preferedformat': 'mp4',
+                        }],
+                    }
+                    with ytdl.YoutubeDL(ydl_opts) as ydl:
+                        ydl.extract_info(playlist_url, download=True)
 
-                with ytdl.YoutubeDL(ydl_opts) as ydl:
-                    info_dict = ydl.extract_info(playlist_url, download=True)
-                
-                # Get the list of downloaded video files
-                video_files = list(download_dir.glob('*.mp4'))
-                
-                if not video_files:
-                    st.error("No videos were downloaded from the playlist.")
-                else:
-                    # Display videos
-                    for video_file in video_files:
-                        st.video(str(video_file), format="video/mp4", start_time=0)
+                    files = list(Path(temp_dir).glob('*.mp4'))
+                    if files:
+                        st.session_state.video_paths = [str(f) for f in files]
+                        st.session_state.current_input = playlist_url
+                        st.success(f"Downloaded {len(files)} video(s)")
+                    else:
+                        st.error("No .mp4 files were downloaded.")
+                        st.session_state.video_paths = []
+                except Exception as e:
+                    st.error(f"Playlist download failed: {e}")
+                    st.session_state.video_paths = []
 
-            except Exception as e:
-                st.error(f"An error occurred while downloading the playlist: {e}")
+        # Show all videos
+        for path in st.session_state.video_paths:
+            if Path(path).exists():
+                st.video(path, format="video/mp4")
 
-# Text input for user to ask questions about the video(s)
+elif video_option == "Provide direct video URL (.mp4)":
+    direct_url = st.text_input(
+        "Enter direct video URL",
+        placeholder="https://example.com/video.mp4",
+        key="direct_url"
+    )
+    if direct_url:
+        if (st.session_state.current_input != direct_url or
+                not st.session_state.video_paths or
+                not Path(st.session_state.video_paths[0]).exists()):
+
+            with st.spinner("Downloading video from URL..."):
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    video_filename = Path(temp_dir) / "direct_video.mp4"
+
+                    response = requests.get(direct_url, stream=True, timeout=45)
+                    response.raise_for_status()
+
+                    with open(video_filename, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    if video_filename.exists() and video_filename.stat().st_size > 10000:
+                        st.session_state.video_paths = [str(video_filename)]
+                        st.session_state.current_input = direct_url
+                        st.success("Video downloaded!")
+                    else:
+                        st.error("Downloaded file is invalid or empty.")
+                        st.session_state.video_paths = []
+                except Exception as e:
+                    st.error(f"Download failed: {e}")
+                    st.session_state.video_paths = []
+
+        if st.session_state.video_paths and Path(st.session_state.video_paths[0]).exists():
+            st.video(st.session_state.video_paths[0], format="video/mp4")
+
+# ────────────────────────────────────────────────
+# ANALYSIS SECTION
+# ────────────────────────────────────────────────
+
 user_query = st.text_area(
     "What insights are you seeking from the video?",
-    placeholder="Ask anything about the video content. The AI agent will analyze and gather additional context if needed.",
-    help="Provide specific questions or insights you want from the video."
+    placeholder="Ask anything about the video content...",
+    height=120
 )
 
-if st.button("🔍 Analyze Video(s)", key="analyze_video_button"):
-    if not user_query:
-        st.warning("Please enter a question or insight to analyze the video.")
+if st.button("🔍 Analyze Video(s)", key="analyze_button"):
+    if not user_query.strip():
+        st.warning("Please enter a question or insight to analyze.")
+    elif not st.session_state.video_paths:
+        st.warning("No video(s) loaded yet. Please provide a video first.")
     else:
         try:
-            with st.spinner("Processing video(s) and gathering insights..."):
-                video_paths = []
-
-                # Process single video or playlist
-                if video_option == "Upload Video" and video_file:
-                    video_paths.append(video_path)
-                elif video_option == "Provide YouTube Link" and youtube_url:
-                    video_paths.append(video_filename)
-                elif video_option == "Provide YouTube Playlist Link" and playlist_url:
-                    # Add all playlist videos to the video_paths list
-                    video_paths.extend([str(video_file) for video_file in download_dir.glob('*.mp4')])
-
-                # Analyze each video in the playlist
+            with st.spinner("Processing video(s) and generating insights..."):
                 processed_videos = []
-                for video_path in video_paths:
-                    processed_video = upload_file(video_path)
-                    while processed_video.state.name == "PROCESSING":
+                for path in st.session_state.video_paths:
+                    if not Path(path).exists():
+                        st.warning(f"Video file no longer exists: {path}")
+                        continue
+                    uploaded = upload_file(path)
+                    while uploaded.state.name == "PROCESSING":
                         time.sleep(1)
-                        processed_video = get_file(processed_video.name)
-                    processed_videos.append(processed_video)
+                        uploaded = get_file(uploaded.name)
+                    processed_videos.append(uploaded)
 
-                # Aggregate insights from all videos
-                analysis_prompt = (
-                    f"""
-                    Analyze the uploaded videos and respond to the following query using video insights from all videos:
-                    {user_query}
+                if not processed_videos:
+                    st.error("No valid videos could be uploaded for analysis.")
+                else:
+                    analysis_prompt = f"""
+Analyze the uploaded videos and respond to the following query using insights from all videos:
+{user_query}
 
-                    Provide a detailed, user-friendly, and actionable response based on the content of the videos.
-                    """
-                )
+Provide a detailed, user-friendly, and actionable response based on the content of the videos.
+"""
 
-                # AI agent processing
-                response = multimodal_Agent.run(analysis_prompt, videos=processed_videos)
+                    response = multimodal_Agent.run(analysis_prompt, videos=processed_videos)
 
-            # Display the result
-            st.subheader("Analysis Result")
-            st.markdown(response.content)
+                    st.subheader("Analysis Result")
+                    st.markdown(response.content)
 
         except Exception as error:
             st.error(f"An error occurred during analysis: {error}")
 
-# Customize text area height
+# Optional: Reset button
+if st.button("Clear current video(s) and start over"):
+    st.session_state.video_paths = []
+    st.session_state.current_input = None
+    st.session_state.last_uploaded_name = None
+    st.rerun()
+
+# Custom styling
 st.markdown(
     """
     <style>
     .stTextArea textarea {
-        height: 100px;
+        height: 120px;
     }
     </style>
     """,
